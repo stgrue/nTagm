@@ -256,7 +256,7 @@ def compute_accuracy(path, data_source):
 
 
 if __name__ == "__main__":
-    options = Options("config001.yaml")
+    options = Options(argv[1])
     
     # Load data
     mappings = input_labels_to_ix, input_ix_to_labels, output_labels_to_ix, output_ix_to_labels = load_mappings(options.model)
