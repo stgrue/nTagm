@@ -7,9 +7,13 @@ import numpy as np
 
 from random import shuffle
 
-from yaml_parser import Options
+from yaml_parser import Config
 from load_data import SequenceBatchContainer, create_lookup_matrix, load_mappings, load_sequences, compute_dimensionality
 
+
+### -------------------------------------
+### LSTM CODE
+### -------------------------------------
 
 class LSTMTagger:
     def __init__(self, session, model):
@@ -130,7 +134,15 @@ class LSTMTagger:
 
             self.global_step = tf.Variable(0, trainable=False, name="global_step")
             self.learning_rate = tf.train.exponential_decay(model.optimizer.learning_rate, self.global_step, model.optimizer.decay_step, model.optimizer.decay_factor, staircase=True, name="learning_rate")
-            self.train_op = tf.train.RMSPropOptimizer(self.learning_rate, name="optimizer").minimize(self.overall_loss, global_step=self.global_step, name="train_op")
+            if model.optimizer.name == "RMSProp":
+                self.optimizer = tf.train.RMSPropOptimizer(self.learning_rate, name="optimizer")
+            elif model.optimizer.name == "Adam":
+                self.optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate, name="optimizer")
+            else:
+                print("A valid optimizer must be specified!")
+                exit(1)
+            self.train_op = self.optimizer.minimize(self.overall_loss, global_step=self.global_step, name="train_op")
+
 
     def create_lookup_matrices(self, inputs):
         lookup_matrices = list()
@@ -206,18 +218,18 @@ class LSTMTagger:
                     
             
         if training:
-            outputs, loss, _ = sess.run([self.structured_output, self.loss, self.train_op], feed_dict=feed_dict)
+            outputs, loss, _ = self.session.run([self.structured_output, self.loss, self.train_op], feed_dict=feed_dict)
             return outputs, loss
         else:
             if evaluation:
-                outputs, loss = sess.run([self.structured_output, self.loss], feed_dict=feed_dict)
+                outputs, loss = self.session.run([self.structured_output, self.loss], feed_dict=feed_dict)
                 return outputs, loss
             else:
-                outputs = sess.run(self.structured_output, feed_dict=feed_dict)
+                outputs = self.session.run(self.structured_output, feed_dict=feed_dict)
                 return outputs
 
 
-    def predict_sequence(self, inputs, use_labels=None):
+    def predict_sequence(self, inputs, use_labels=None, give_prob_dist=False):
         '''Tag a sequence based on the given inputs, using the model'''
         if use_labels is not None:
             input_labels_to_ix, _, _, output_ix_to_labels = use_labels
@@ -231,56 +243,75 @@ class LSTMTagger:
         outputs = self.run(dummy_batch, evaluation=False, training=False)
         predictions = list()
         for i in range(len(self.model.outputs)):
-            curr_preds = [np.argmax(output_vec) for output_vec in outputs[i][0]]
-            if use_labels is not None:
-                curr_preds = [output_ix_to_labels[i][ix] for ix in curr_preds]
-            predictions.append(curr_preds)  
+            if give_prob_dist:
+                curr_preds = [softmax(output_vec) for output_vec in outputs[i][0]]
+                predictions.append(curr_preds)
+            else:
+                curr_preds = [np.argmax(output_vec) for output_vec in outputs[i][0]]
+                if use_labels is not None:
+                    curr_preds = [output_ix_to_labels[i][ix] for ix in curr_preds]
+                predictions.append(curr_preds)  
+
         return predictions
 
 
-def compute_accuracy(path, data_source):
-    num_constraints = 0
-    num_correct = 0
-    with open(path + "tokens.txt") as tokens_file:
-        with open(path + "tags.txt") as tags_file:
-            with open(path + constraint_type + ".txt") as constraints_file:
-                for line in tokens_file:
-                    tokens = line.strip().split("\t")
-                    tags = next(tags_file).strip().split("\t")
-                    gold_constraints = next(constraints_file).strip().split("\t")
-                    gold_constraints = [int(constr) for constr in gold_constraints]
-                    predicted_constraints = net.constrain_sequence(tokens, tags)
-                    assert len(tokens) == len(tags) == len(gold_constraints) == len(predicted_constraints)
-                    num_constraints += len(gold_constraints)
-                    for (predicted_constraint, gold_constraint) in zip(predicted_constraints, gold_constraints):
-                        if predicted_constraint == gold_constraint:
-                            num_correct += 1
 
-    return num_correct / num_constraints
+
+### -------------------------------------
+### HELPER FUNCTIONS
+### -------------------------------------
+
+def softmax(x):
+    """Apply the softmax function to a vector"""
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum()
+
+
+def restore_config(config_filename, model_savepath=None):
+    '''Returns an LSTMTagger and mappings based on a config file and saved data'''
+    config = Config(config_filename)
+    
+    model_path = model_savepath if model_savepath is not None else "./{}_model".format(config.model.name)
+    sess = tf.InteractiveSession()
+    net = LSTMTagger(sess, config.model)
+    saver = tf.train.Saver()
+
+    print("Loading model from {}".format(model_path))
+    restore_model(saver, net.session, model_path)
+
+    mappings = input_labels_to_ix, input_ix_to_labels, output_labels_to_ix, output_ix_to_labels = load_mappings(config.model)
+
+    return net, mappings
 
 
 def restore_model(saver, session, model_path):
-    if model_path.endswith("/"):
-        model_path = model_path[:-1]
+    ''''Restores model from save at given path'''
+    chkpt = tf.train.latest_checkpoint(model_path)
     try:
-       saver.restore(session, "{}/tagging_model".format(model_path)) 
+       saver.restore(session, chkpt) 
     except:
         print("Fatal error: Model could not be loaded from {}".format(model_path))
         exit(1)
 
+
+
+
+### -------------------------------------
+### MAIN PROGRAM
+### -------------------------------------
         
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description='')
-    argparser.add_argument("options_file", type=str, help="Path of options file (mandatory)")
+    argparser.add_argument("config_file", type=str, help="Path of config file (mandatory)")
     argparser.add_argument("-m", "--mode", type=str, default="training", help="Mode (training, evaluation, load). Default: training")
     argparser.add_argument("-n", "--num-epochs", dest="num_epochs", type=int, default=10, help="Number of epochs when training. Default: 10")
     argparser.add_argument("--model-path", dest="model_path", type=str, help="Name of folder where model is stored. Default: [Name of config]_model")
     
     args = argparser.parse_args()
-    options = Options(args.options_file)
+    config = Config(args.config_file)
     
     if args.mode == "training":
-        model_path = args.model_path if args.model_path is not None else "./{}_model".format(options.model.name)
+        model_path = args.model_path if args.model_path is not None else "./{}_model".format(config.model.name)
         model_path = model_path[:-1] if model_path.endswith("/") else model_path
         if os.path.isdir(model_path):
             print("WARNING: Path {} already exists. Its contents will be overwritten during training.".format(model_path))
@@ -295,17 +326,17 @@ if __name__ == "__main__":
             else:
                 os.makedirs(model_path)
 
-        print("Training model {}".format(options.model.name))
+        print("Training model {}".format(config.model.name))
         print("Saving model to {}".format(model_path))
 
         # Load data
-        mappings = input_labels_to_ix, input_ix_to_labels, output_labels_to_ix, output_ix_to_labels = load_mappings(options.model)
-        training_batches = load_sequences(options.training_data, mappings)
-        development_batches = load_sequences(options.development_data, mappings)
+        mappings = input_labels_to_ix, input_ix_to_labels, output_labels_to_ix, output_ix_to_labels = load_mappings(config.model)
+        training_batches = load_sequences(config.training_data, mappings)
+        development_batches = load_sequences(config.development_data, mappings)
 
         # Set up network
         sess = tf.InteractiveSession()
-        net = LSTMTagger(sess, options.model)
+        net = LSTMTagger(sess, config.model)
         sess.run(tf.global_variables_initializer())
         saver = tf.train.Saver()
 
@@ -327,46 +358,36 @@ if __name__ == "__main__":
             print("Accuracy:", acc)
             print()
 
-            saver.save(sess, "{}/tagging_model".format(model_path))
+            saver.save(sess, "{}/tagging_model".format(model_path), global_step=epoch)
      
         print("Training finished. Goodbye.")
 
+
     elif args.mode == "evaluation":
-        # Load network from saved file
-        sess = tf.InteractiveSession()
-        net = LSTMTagger(sess, options.model)
+        # Restore config 
+        net, mappings = restore_config(args.config_file, args.model_path)
 
-        saver = tf.train.Saver()
-        model_path = args.model_path if args.model_path is not None else "./{}_model".format(options.model.name)
-        print("Loading model from {}".format(model_path))
-        restore_model(saver, sess, model_path)
-
-        # Load data and do evaluation
-        mappings = input_labels_to_ix, input_ix_to_labels, output_labels_to_ix, output_ix_to_labels = load_mappings(options.model)
-        training_batches = load_sequences(options.training_data, mappings)
-        development_batches = load_sequences(options.development_data, mappings)
-
-        print("Evaluation on training set:")
-        loss, acc = net.run_many(training_batches, training=False)
-        print("Loss:", loss)
-        print("Accuracy:", acc)
-        print()
+        # Get development and test batches
+        development_batches = load_sequences(config.development_data, mappings)
+        test_batches = load_sequences(config.test_data, mappings)
 
         print("Evaluation on development set:")
         loss, acc = net.run_many(development_batches, training=False)
         print("Loss:", loss)
         print("Accuracy:", acc)
         print()
+
+        print("Evaluation on test set:")
+        loss, acc = net.run_many(test_batches, training=False)
+        print("Loss:", loss)
+        print("Accuracy:", acc)
+        print()
+
         
     elif args.mode == "load":
         # Load network from saved file
-        sess = tf.InteractiveSession()
-        net = LSTMTagger(sess, options.model)
+        net, mappings = restore_config(args.config_file, args.model_path)
 
-        saver = tf.train.Saver()
-        model_path = args.model_path if args.model_path is not None else "./{}_model".format(options.model.name)
-        print("Loading model from {}".format(model_path))
-        restore_model(saver, sess, model_path)
 
     else:
         print('"{}" is not a valid mode!'.format(args.mode))

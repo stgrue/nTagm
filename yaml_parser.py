@@ -19,7 +19,7 @@ def is_list(d):
 
 
 
-class Options():
+class Config():
     def __init__(self, yaml_path):
         with open(yaml_path, encoding="utf-8") as f:
             options_dict = yaml.load(f.read())
